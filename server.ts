@@ -6,8 +6,6 @@ import Fastify from 'fastify';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
 import * as child_process from 'child_process';
-import mysql from 'mysql2/promise';
-
 // --- Configuration ---
 
 const PORT = parseInt(process.env.PERRY_DASHBOARD_PORT || '3001', 10);
@@ -21,20 +19,6 @@ const POLAR_WEBHOOK_SECRET = process.env.POLAR_WEBHOOK_SECRET || '';
 const POLAR_PRODUCT_PRO_MONTHLY = process.env.POLAR_PRODUCT_PRO_MONTHLY || '';
 
 const outDir = './out';
-
-// --- Database (same MySQL as hub) ---
-
-function createDbPool(): any {
-  return mysql.createPool({
-    host: process.env.PERRY_DB_HOST || 'localhost',
-    port: parseInt(process.env.PERRY_DB_PORT || '3306', 10),
-    user: process.env.PERRY_DB_USER || 'perry',
-    password: process.env.PERRY_DB_PASSWORD || '',
-    database: process.env.PERRY_DB_NAME || 'perry_hub',
-  });
-}
-
-const db = createDbPool();
 
 // --- Device flow state (in-memory, keyed by device code) ---
 
@@ -94,16 +78,37 @@ function getSessionToken(request: any): string {
   return '';
 }
 
-async function getAccountByToken(token: string): Promise<any> {
-  if (!token) return null;
-  try {
-    const result = await db.query('SELECT id, github_username, github_id, email, tier, polar_customer_id, polar_subscription_id, api_token, has_payment_method FROM accounts WHERE api_token = ?', [token]);
-    const rows: any = result[0];
-    if (rows.length > 0) return rows[0];
-  } catch (e: any) {
-    console.error('getAccountByToken error:', e.message || e);
+function getAccountByToken(token: string): any {
+  if (!token) {
+    console.log('getAccountByToken: empty token');
+    return null;
   }
-  return null;
+  // Use hub API instead of direct DB — Perry's mysql2 has issues in dashboard context
+  console.log('getAccountByToken: calling hub API for token=' + token.substring(0, 12) + '...');
+  const result = curlExec(
+    'curl -s -m 5 "' + HUB_URL + '/api/v1/account" -H "Authorization: Bearer ' + token + '"'
+  );
+  console.log('getAccountByToken hub result: ' + result.substring(0, 100));
+  if (!result) return null;
+  try {
+    const parsed = JSON.parse(result);
+    if (parsed.error) return null;
+    // Return in the shape the rest of the code expects
+    return {
+      id: parsed.id || '',
+      github_username: parsed.github_username || '',
+      github_id: '',
+      email: parsed.email || '',
+      tier: parsed.tier || 'free',
+      polar_customer_id: '',
+      polar_subscription_id: '',
+      api_token: token,
+      has_payment_method: parsed.has_payment_method || false,
+    };
+  } catch (e) {
+    console.error('getAccountByToken parse error');
+    return null;
+  }
 }
 
 function curlExec(cmd: string): string {
@@ -131,7 +136,8 @@ app.get('/api/auth/github', async (request: any, reply: any) => {
   const encodedCallback = callbackUrl.replace(/:/g, '%3A').replace(/\//g, '%2F');
   const encodedState = state.replace(/:/g, '%3A').replace(/\//g, '%2F');
   const url = 'https://github.com/login/oauth/authorize?client_id=' + GITHUB_CLIENT_ID + '&redirect_uri=' + encodedCallback + '&scope=read:user%20user:email&state=' + encodedState;
-  reply.status(302).header('Location', url).send('');
+  reply.status(302).header('Location', url);
+  return 'redirect';
 });
 
 // GET /api/auth/callback — GitHub OAuth callback
@@ -157,18 +163,24 @@ app.get('/api/auth/callback', async (request: any, reply: any) => {
     'curl -s -X POST "https://github.com/login/oauth/access_token" -H "Accept: application/json" -d "client_id=' + GITHUB_CLIENT_ID + '&client_secret=' + GITHUB_CLIENT_SECRET + '&code=' + code + '"'
   );
 
+  console.log('OAuth callback: code=' + code.substring(0, 6) + '... state=' + state.substring(0, 20) + '...');
+  console.log('Token exchange curl result length: ' + String(tokenResult.length));
+  console.log('Token result: ' + tokenResult.substring(0, 200));
+
   const tokenMatch = tokenResult.match(/"access_token"\s*:\s*"([^"]+)"/);
   if (!tokenMatch) {
     console.error('GitHub token exchange failed:', tokenResult);
-    reply.status(500).header('Content-Type', 'text/html').send('<h1>Authentication failed</h1>');
+    reply.status(500).header('Content-Type', 'text/html').send('<h1>Authentication failed</h1><p>Token exchange failed. Check server logs.</p><pre>' + tokenResult.substring(0, 500) + '</pre>');
     return;
   }
   const githubToken = tokenMatch[1];
+  console.log('Got GitHub token: ' + githubToken.substring(0, 8) + '...');
 
   // Fetch user info
   const userResult = curlExec(
     'curl -s "https://api.github.com/user" -H "Authorization: Bearer ' + githubToken + '" -H "User-Agent: perry-dashboard" -H "Accept: application/vnd.github+json"'
   );
+  console.log('User result length: ' + String(userResult.length));
 
   const loginMatch = userResult.match(/"login"\s*:\s*"([^"]+)"/);
   const idMatch = userResult.match(/"id"\s*:\s*(\d+)/);
@@ -176,7 +188,7 @@ app.get('/api/auth/callback', async (request: any, reply: any) => {
 
   if (!loginMatch || !idMatch) {
     console.error('GitHub user fetch failed:', userResult);
-    reply.status(500).header('Content-Type', 'text/html').send('<h1>Failed to get user info</h1>');
+    reply.status(500).header('Content-Type', 'text/html').send('<h1>Failed to get user info</h1><pre>' + userResult.substring(0, 500) + '</pre>');
     return;
   }
 
@@ -189,55 +201,72 @@ app.get('/api/auth/callback', async (request: any, reply: any) => {
     'curl -s -X POST "' + HUB_URL + '/api/v1/account/create" -H "Authorization: Bearer ' + HUB_ADMIN_SECRET + '" -H "Content-Type: application/json" -d \'{"github_id":"' + ghId + '","github_username":"' + jsonEscape(ghUsername) + '","email":"' + jsonEscape(ghEmail) + '"}\''
   );
 
+  console.log('Hub account create result: ' + accountResult.substring(0, 300));
+
   const apiTokenMatch = accountResult.match(/"api_token"\s*:\s*"([^"]+)"/);
   if (!apiTokenMatch) {
     console.error('Hub account create failed:', accountResult);
-    reply.status(500).header('Content-Type', 'text/html').send('<h1>Account creation failed</h1>');
+    reply.status(500).header('Content-Type', 'text/html').send('<h1>Account creation failed</h1><pre>' + accountResult.substring(0, 500) + '</pre>');
     return;
   }
   const apiToken = apiTokenMatch[1];
+  console.log('Setting cookie and redirecting to ' + redirectTo);
 
   // Set session cookie and redirect
   reply.header('Set-Cookie', 'perry_session=' + apiToken + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000');
-  reply.status(302).header('Location', redirectTo).send('');
+  reply.header('Location', redirectTo);
+  reply.status(302);
+  return 'redirect';
 });
 
 // GET /api/auth/me — return current user
 app.get('/api/auth/me', async (request: any, reply: any) => {
   reply.header('Content-Type', 'application/json');
+  const rawCookie = request.headers['cookie'] || '';
+  console.log('/api/auth/me cookie header: "' + rawCookie.substring(0, 80) + '"');
   const token = getSessionToken(request);
+  console.log('/api/auth/me extracted token: "' + token.substring(0, 20) + '"');
   if (!token) {
+    console.log('/api/auth/me: no token, returning 401');
     reply.status(401);
     return JSON.stringify({ error: { code: 'AUTH_REQUIRED', message: 'Not signed in' } });
   }
 
-  const account = await getAccountByToken(token);
-  if (!account) {
+  // Get full account + usage from hub in one call
+  console.log('/api/auth/me: calling hub with token=' + token.substring(0, 12) + '...');
+  const hubResult = curlExec(
+    'curl -s -m 5 "' + HUB_URL + '/api/v1/account" -H "Authorization: Bearer ' + token + '"'
+  );
+  console.log('/api/auth/me: hub result=' + hubResult.substring(0, 80));
+
+  if (!hubResult) {
+    reply.status(502);
+    return JSON.stringify({ error: { code: 'HUB_UNAVAILABLE', message: 'Hub unreachable' } });
+  }
+
+  let hubData: any;
+  try {
+    hubData = JSON.parse(hubResult);
+  } catch (e) {
+    reply.status(502);
+    return JSON.stringify({ error: { code: 'HUB_ERROR', message: 'Invalid hub response' } });
+  }
+
+  if (hubData.error) {
     reply.status(401);
     return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Invalid session' } });
   }
 
-  // Get usage from hub
-  const usageResult = curlExec(
-    'curl -s "' + HUB_URL + '/api/v1/account" -H "Authorization: Bearer ' + token + '"'
-  );
-
-  let usage = { publishes: 0, publish_limit: 15, deep_verifies: 0, verify_limit: 2, period: '' };
-  try {
-    const parsed = JSON.parse(usageResult);
-    if (parsed.usage) usage = parsed.usage;
-  } catch (e) { /* use defaults */ }
-
   return JSON.stringify({
     account: {
-      id: account.id,
-      github_username: account.github_username,
-      email: account.email || '',
-      tier: account.tier,
-      has_payment_method: account.has_payment_method ? true : false,
-      usage,
+      id: hubData.id || '',
+      github_username: hubData.github_username || '',
+      email: hubData.email || '',
+      tier: hubData.tier || 'free',
+      has_payment_method: hubData.has_payment_method || false,
+      usage: hubData.usage || { publishes: 0, publish_limit: 15, deep_verifies: 0, verify_limit: 2, period: '' },
     },
-    api_token: account.api_token,
+    api_token: token,
   });
 });
 
@@ -256,7 +285,7 @@ app.post('/api/checkout', async (request: any, reply: any) => {
     reply.status(401);
     return JSON.stringify({ error: { code: 'AUTH_REQUIRED', message: 'Not signed in' } });
   }
-  const account = await getAccountByToken(token);
+  const account = getAccountByToken(token);
   if (!account) {
     reply.status(401);
     return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Invalid session' } });
@@ -290,7 +319,7 @@ app.post('/api/portal', async (request: any, reply: any) => {
     reply.status(401);
     return JSON.stringify({ error: { code: 'AUTH_REQUIRED', message: 'Not signed in' } });
   }
-  const account = await getAccountByToken(token);
+  const account = getAccountByToken(token);
   if (!account) {
     reply.status(401);
     return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Invalid session' } });
@@ -429,7 +458,7 @@ app.post('/api/cli/authorize', async (request: any, reply: any) => {
     reply.status(401);
     return JSON.stringify({ error: { code: 'AUTH_REQUIRED', message: 'Sign in first' } });
   }
-  const account = await getAccountByToken(token);
+  const account = getAccountByToken(token);
   if (!account) {
     reply.status(401);
     return JSON.stringify({ error: { code: 'AUTH_INVALID', message: 'Invalid session' } });
